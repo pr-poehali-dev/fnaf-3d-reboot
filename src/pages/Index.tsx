@@ -1,900 +1,875 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── TYPES ───────────────────────────────────────────────────────────────────
-type Room = "cam1A" | "cam1B" | "cam1C" | "cam2A" | "cam2B" | "cam3" | "cam4A" | "cam4B";
-type AnimatronicId = "bonnie" | "chica" | "freddy" | "foxy";
+// ─── TYPES ────────────────────────────────────────────────────────────────────
 type GamePhase = "menu" | "playing" | "dead" | "win";
-type View = "office" | "cameras";
+type Direction = "left" | "right" | "forward" | "back";
+type AnimId = "bonnie" | "chica" | "freddy" | "foxy";
+
+interface Vec2 { x: number; y: number; }
 
 interface Animatronic {
-  id: AnimatronicId;
+  id: AnimId;
   name: string;
-  room: Room | "left_door" | "right_door" | "gone";
-  path: (Room | "left_door" | "right_door")[];
-  moveTimer: number;
-  moveInterval: number;
   emoji: string;
   color: string;
+  // grid position (0..MAP_W-1, 0..MAP_H-1)
+  x: number;
+  y: number;
+  moveTimer: number;
+  moveInterval: number; // ticks between moves
+  active: boolean;
 }
 
-interface GameState {
-  phase: GamePhase;
-  view: View;
-  activeCamera: Room;
-  hour: number;
-  battery: number;
-  leftDoorClosed: boolean;
-  rightDoorClosed: boolean;
-  leftLightOn: boolean;
-  rightLightOn: boolean;
-  animatronics: Animatronic[];
-  night: number;
-  screamSource: AnimatronicId | null;
-  showStatic: boolean;
-  cameraUp: boolean;
-}
-
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const ROOMS: Record<Room, { name: string; neighbors: Room[] }> = {
-  cam1A: { name: "Сцена", neighbors: ["cam1B", "cam1C"] },
-  cam1B: { name: "Гримёрка", neighbors: ["cam1A", "cam3", "cam2A"] },
-  cam1C: { name: "Пиццерия", neighbors: ["cam1A", "cam2B"] },
-  cam2A: { name: "Зап. коридор", neighbors: ["cam1B", "cam3"] },
-  cam2B: { name: "Вост. коридор", neighbors: ["cam1C", "cam4A"] },
-  cam3:  { name: "Туалеты",       neighbors: ["cam1B", "cam2A"] },
-  cam4A: { name: "Кухня",         neighbors: ["cam2B", "cam4B"] },
-  cam4B: { name: "Бэкстейдж",     neighbors: ["cam4A"] },
-};
-
-const INITIAL_ANIMATRONICS: Animatronic[] = [
-  {
-    id: "bonnie", name: "Бонни", room: "cam1A",
-    path: ["cam1A","cam1B","cam2A","cam3","cam2A"],
-    moveTimer: 0, moveInterval: 12,
-    emoji: "🐰", color: "#7C3AED",
-  },
-  {
-    id: "chica", name: "Чика", room: "cam1A",
-    path: ["cam1A","cam1C","cam2B","cam4A","cam4B"],
-    moveTimer: 0, moveInterval: 15,
-    emoji: "🐦", color: "#D97706",
-  },
-  {
-    id: "freddy", name: "Фредди", room: "cam1A",
-    path: ["cam1A","cam1B","cam1C","cam2B","cam4A"],
-    moveTimer: 0, moveInterval: 20,
-    emoji: "🐻", color: "#92400E",
-  },
-  {
-    id: "foxy", name: "Фокси", room: "cam2A",
-    path: ["cam2A","cam1B","cam2A"],
-    moveTimer: 0, moveInterval: 10,
-    emoji: "🦊", color: "#DC2626",
-  },
+// ─── MAP ─────────────────────────────────────────────────────────────────────
+// 0 = wall, 1 = floor, 2 = player start, 9 = door (left=col0 right=colMAX)
+const MAP_W = 9;
+const MAP_H = 9;
+const RAW_MAP = [
+  [0,0,0,0,1,0,0,0,0],
+  [0,1,1,1,1,1,1,1,0],
+  [0,1,0,0,1,0,0,1,0],
+  [0,1,0,0,1,0,0,1,0],
+  [1,1,1,1,2,1,1,1,1],
+  [0,1,0,0,1,0,0,1,0],
+  [0,1,0,0,1,0,0,1,0],
+  [0,1,1,1,1,1,1,1,0],
+  [0,0,0,0,1,0,0,0,0],
 ];
 
-const BATTERY_DRAIN_BASE = 0.012;
-const DOOR_DRAIN = 0.018;
-const LIGHT_DRAIN = 0.008;
-const CAMERA_DRAIN = 0.006;
-const HOUR_DURATION = 45000; // ms per in-game hour
+// Player starts at the '2' cell
+const PLAYER_START: Vec2 = { x: 4, y: 4 };
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function clamp(v: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, v));
+// ─── RAYCASTER ────────────────────────────────────────────────────────────────
+const FOV = Math.PI / 3; // 60°
+const HALF_FOV = FOV / 2;
+const RAY_COUNT = 120;
+const MAX_DEPTH = 12;
+
+function isWall(map: number[][], x: number, y: number): boolean {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  if (xi < 0 || xi >= MAP_W || yi < 0 || yi >= MAP_H) return true;
+  return map[yi][xi] === 0;
 }
 
-function getRoomAnimatronics(anims: Animatronic[], room: Room | string) {
-  return anims.filter(a => a.room === room);
+interface RayHit {
+  dist: number;
+  wallX: number; // fractional hit pos (for texturing)
+  side: 0 | 1;  // 0=NS, 1=EW
 }
 
-// ─── STATIC OVERLAY ───────────────────────────────────────────────────────────
-function StaticOverlay({ intensity = 1 }: { intensity?: number }) {
-  return (
-    <div
-      className="absolute inset-0 pointer-events-none z-10"
-      style={{
-        backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.15'/%3E%3C/svg%3E")`,
-        opacity: intensity * 0.4,
-        mixBlendMode: "screen",
-      }}
-    />
-  );
+function castRay(map: number[][], px: number, py: number, angle: number): RayHit {
+  const dx = Math.cos(angle);
+  const dy = Math.sin(angle);
+
+  // DDA algorithm
+  let mapX = Math.floor(px);
+  let mapY = Math.floor(py);
+
+  const deltaDistX = Math.abs(1 / dx);
+  const deltaDistY = Math.abs(1 / dy);
+
+  let stepX: number, stepY: number;
+  let sideDistX: number, sideDistY: number;
+
+  if (dx < 0) { stepX = -1; sideDistX = (px - mapX) * deltaDistX; }
+  else        { stepX =  1; sideDistX = (mapX + 1 - px) * deltaDistX; }
+  if (dy < 0) { stepY = -1; sideDistY = (py - mapY) * deltaDistY; }
+  else        { stepY =  1; sideDistY = (mapY + 1 - py) * deltaDistY; }
+
+  let side: 0 | 1 = 0;
+  let hit = false;
+  let depth = 0;
+
+  while (!hit && depth < MAX_DEPTH * 10) {
+    if (sideDistX < sideDistY) {
+      sideDistX += deltaDistX;
+      mapX += stepX;
+      side = 0;
+    } else {
+      sideDistY += deltaDistY;
+      mapY += stepY;
+      side = 1;
+    }
+    if (isWall(map, mapX, mapY)) hit = true;
+    depth++;
+  }
+
+  let dist: number;
+  if (side === 0) dist = sideDistX - deltaDistX;
+  else            dist = sideDistY - deltaDistY;
+
+  // Wall X for texture
+  let wallX: number;
+  if (side === 0) wallX = py + dist * dy;
+  else            wallX = px + dist * dx;
+  wallX -= Math.floor(wallX);
+
+  return { dist: Math.max(0.1, dist), wallX, side };
 }
 
-// ─── SCREAM SCREEN ────────────────────────────────────────────────────────────
-function ScreamScreen({ anim, onDone }: { anim: Animatronic; onDone: () => void }) {
-  useEffect(() => {
-    const t = setTimeout(onDone, 2800);
-    return () => clearTimeout(t);
-  }, [onDone]);
-
-  return (
-    <div
-      className="absolute inset-0 z-50 flex items-center justify-center animate-scream"
-      style={{ background: "#000" }}
-    >
-      <div className="text-center">
-        <div
-          className="text-[160px] leading-none animate-scream-emoji"
-          style={{ filter: `drop-shadow(0 0 40px ${anim.color})` }}
-        >
-          {anim.emoji}
-        </div>
-        <div
-          className="text-4xl font-black mt-4 tracking-widest uppercase"
-          style={{ color: anim.color, textShadow: `0 0 30px ${anim.color}` }}
-        >
-          {anim.name.toUpperCase()}
-        </div>
-        <div className="text-red-500 text-xl mt-2 font-bold animate-pulse">ВЫ МЕРТВЫ</div>
-      </div>
-      <div className="absolute inset-0 bg-red-900/20 animate-pulse" />
-    </div>
-  );
-}
-
-// ─── CAMERA VIEW ─────────────────────────────────────────────────────────────
-function CameraView({
-  activeCamera, animatronics, onSelectCamera, showStatic,
-}: {
-  activeCamera: Room;
+// ─── CANVAS RENDERER ─────────────────────────────────────────────────────────
+interface RenderState {
+  px: number; py: number; angle: number;
+  map: number[][];
   animatronics: Animatronic[];
-  onSelectCamera: (r: Room) => void;
-  showStatic: boolean;
-}) {
-  const room = ROOMS[activeCamera];
-  const present = getRoomAnimatronics(animatronics, activeCamera);
-
-  return (
-    <div className="absolute inset-0 bg-black flex flex-col">
-      {/* Camera feed */}
-      <div className="flex-1 relative overflow-hidden" style={{ background: "radial-gradient(ellipse at center, #0a1a0a 0%, #000 100%)" }}>
-        <StaticOverlay intensity={showStatic ? 1 : 0.3} />
-
-        {/* CRT scanlines */}
-        <div
-          className="absolute inset-0 pointer-events-none z-10"
-          style={{
-            backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.15) 2px, rgba(0,0,0,0.15) 4px)",
-          }}
-        />
-
-        {/* Room name */}
-        <div className="absolute top-3 left-4 z-20">
-          <span className="text-green-400 font-mono text-xs tracking-widest uppercase">
-            CAM {activeCamera.toUpperCase()} — {room.name}
-          </span>
-        </div>
-
-        {/* REC indicator */}
-        <div className="absolute top-3 right-4 z-20 flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-          <span className="text-red-400 font-mono text-xs">REC</span>
-        </div>
-
-        {/* Room visual */}
-        <div className="absolute inset-0 flex items-center justify-center">
-          <RoomScene room={activeCamera} animatronics={present} />
-        </div>
-
-        {/* Timestamp */}
-        <div className="absolute bottom-3 right-4 z-20 text-green-400/50 font-mono text-xs">
-          {new Date().toLocaleTimeString()}
-        </div>
-      </div>
-
-      {/* Camera selector */}
-      <div className="bg-gray-950 border-t border-green-900/30 p-2">
-        <div className="grid grid-cols-4 gap-1.5">
-          {(Object.keys(ROOMS) as Room[]).map(r => {
-            const hasAnim = getRoomAnimatronics(animatronics, r).length > 0;
-            return (
-              <button
-                key={r}
-                onClick={() => onSelectCamera(r)}
-                className={`relative px-2 py-1.5 rounded text-xs font-mono transition-all border ${
-                  activeCamera === r
-                    ? "bg-green-900/40 border-green-500 text-green-300"
-                    : "bg-gray-900 border-gray-700 text-gray-500 hover:border-gray-500"
-                }`}
-              >
-                {r.toUpperCase()}
-                {hasAnim && (
-                  <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                )}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
+  flashlightOn: boolean;
+  flickerAlpha: number;
+  doorLeft: boolean;
+  doorRight: boolean;
+  hour: number;
 }
 
-// ─── ROOM SCENE ──────────────────────────────────────────────────────────────
-function RoomScene({ room, animatronics }: { room: Room; animatronics: Animatronic[] }) {
-  const roomVisuals: Record<Room, { bg: string; elements: string }> = {
-    cam1A: {
-      bg: "from-gray-900 via-gray-800 to-gray-900",
-      elements: "🎭 Главная сцена",
-    },
-    cam1B: {
-      bg: "from-purple-950 via-gray-900 to-gray-950",
-      elements: "🎪 Гримёрка",
-    },
-    cam1C: {
-      bg: "from-gray-900 via-yellow-950 to-gray-900",
-      elements: "🍕 Пиццерия",
-    },
-    cam2A: {
-      bg: "from-gray-950 via-gray-900 to-gray-950",
-      elements: "🚪 Западный коридор",
-    },
-    cam2B: {
-      bg: "from-gray-950 via-gray-900 to-gray-950",
-      elements: "🚪 Восточный коридор",
-    },
-    cam3: {
-      bg: "from-gray-950 via-slate-900 to-gray-950",
-      elements: "🚻 Туалеты",
-    },
-    cam4A: {
-      bg: "from-gray-950 via-red-950 to-gray-950",
-      elements: "🍳 Кухня",
-    },
-    cam4B: {
-      bg: "from-black via-gray-950 to-black",
-      elements: "📦 Бэкстейдж",
-    },
-  };
+function renderFrame(ctx: CanvasRenderingContext2D, W: number, H: number, s: RenderState) {
+  const { px, py, angle, map, flashlightOn, flickerAlpha, doorLeft, doorRight } = s;
 
-  const visual = roomVisuals[room];
+  // Clear
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
 
-  return (
-    <div className={`w-full h-full bg-gradient-to-b ${visual.bg} flex flex-col items-center justify-center relative`}>
-      {/* Perspective corridor lines */}
-      <div className="absolute inset-0 flex items-center justify-center opacity-20">
-        <svg width="100%" height="100%" viewBox="0 0 400 300">
-          <line x1="200" y1="150" x2="0" y2="0" stroke="#1a4a1a" strokeWidth="1" />
-          <line x1="200" y1="150" x2="400" y2="0" stroke="#1a4a1a" strokeWidth="1" />
-          <line x1="200" y1="150" x2="0" y2="300" stroke="#1a4a1a" strokeWidth="1" />
-          <line x1="200" y1="150" x2="400" y2="300" stroke="#1a4a1a" strokeWidth="1" />
-          <rect x="120" y="80" width="160" height="140" fill="none" stroke="#1a4a1a" strokeWidth="1" />
-          <rect x="60" y="40" width="280" height="220" fill="none" stroke="#1a4a1a" strokeWidth="0.5" />
-        </svg>
-      </div>
+  // Ceiling gradient (dark reddish)
+  const ceil = ctx.createLinearGradient(0, 0, 0, H / 2);
+  ceil.addColorStop(0, "#0a0005");
+  ceil.addColorStop(1, "#150010");
+  ctx.fillStyle = ceil;
+  ctx.fillRect(0, 0, W, H / 2);
 
-      <div className="text-green-900/40 text-sm font-mono z-10 mb-6">{visual.elements}</div>
+  // Floor gradient
+  const floor = ctx.createLinearGradient(0, H / 2, 0, H);
+  floor.addColorStop(0, "#0d0008");
+  floor.addColorStop(1, "#050003");
+  ctx.fillStyle = floor;
+  ctx.fillRect(0, H / 2, W, H / 2);
 
-      {/* Animatronics in room */}
-      {animatronics.length > 0 ? (
-        <div className="flex gap-4 z-10">
-          {animatronics.map(a => (
-            <div key={a.id} className="text-center animate-pulse">
-              <div
-                className="text-6xl"
-                style={{ filter: `drop-shadow(0 0 20px ${a.color}) drop-shadow(0 0 40px ${a.color})` }}
-              >
-                {a.emoji}
-              </div>
-              <div className="text-xs font-mono mt-1" style={{ color: a.color }}>{a.name}</div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="text-green-900/20 font-mono text-xs z-10">[ ПУСТО ]</div>
-      )}
-    </div>
-  );
-}
+  // ── Raycasting ──
+  const sliceW = W / RAY_COUNT;
+  const zBuffer: number[] = new Array(RAY_COUNT);
 
-// ─── OFFICE VIEW ─────────────────────────────────────────────────────────────
-function OfficeView({
-  leftDoorClosed, rightDoorClosed,
-  leftLightOn, rightLightOn,
-  onLeftDoor, onRightDoor,
-  onLeftLight, onRightLight,
-  animatronics,
-  battery,
-}: {
-  leftDoorClosed: boolean; rightDoorClosed: boolean;
-  leftLightOn: boolean; rightLightOn: boolean;
-  onLeftDoor: () => void; onRightDoor: () => void;
-  onLeftLight: () => void; onRightLight: () => void;
-  animatronics: Animatronic[];
-  battery: number;
-}) {
-  const leftEnemy = animatronics.find(a => a.room === "left_door");
-  const rightEnemy = animatronics.find(a => a.room === "right_door");
+  for (let i = 0; i < RAY_COUNT; i++) {
+    const rayAngle = angle - HALF_FOV + (i / RAY_COUNT) * FOV;
+    const hit = castRay(map, px, py, rayAngle);
+    zBuffer[i] = hit.dist;
 
-  return (
-    <div className="absolute inset-0 flex" style={{ background: "#050a05" }}>
+    // Fix fisheye
+    const corrDist = hit.dist * Math.cos(rayAngle - angle);
+    const wallH = Math.min(H, H / corrDist);
+    const wallTop = (H - wallH) / 2;
 
-      {/* LEFT PANEL */}
-      <div className="w-28 flex flex-col items-center justify-center gap-3 border-r border-green-900/20 bg-black/40 px-2 py-4">
-        {/* Light preview */}
-        <div
-          className="w-20 h-28 rounded-lg border border-green-900/30 relative overflow-hidden transition-all duration-200"
-          style={{ background: leftLightOn ? (leftEnemy ? "#3a0000" : "#0a1a00") : "#000" }}
-        >
-          {leftLightOn && leftEnemy && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center">
-              <div className="text-4xl" style={{ filter: `drop-shadow(0 0 10px ${leftEnemy.color})` }}>
-                {leftEnemy.emoji}
-              </div>
-            </div>
-          )}
-          {leftLightOn && !leftEnemy && (
-            <div className="absolute inset-0 flex items-center justify-center text-green-900/30 text-xs font-mono">пусто</div>
-          )}
-          {!leftLightOn && leftDoorClosed && (
-            <div className="absolute inset-0 flex items-center justify-center text-gray-700 text-xs">🚪</div>
-          )}
-        </div>
+    // Wall brightness (side shading + distance)
+    const sideDim = hit.side === 1 ? 0.7 : 1.0;
+    const distDim = Math.max(0, 1 - corrDist / MAX_DEPTH);
+    const bright = sideDim * distDim;
 
-        <button
-          onClick={onLeftLight}
-          className={`w-full py-1.5 rounded text-xs font-bold font-mono border transition-all ${
-            leftLightOn
-              ? "bg-yellow-400/20 border-yellow-400 text-yellow-400"
-              : "bg-gray-900 border-gray-700 text-gray-600 hover:border-gray-500"
-          }`}
-        >
-          СВЕТ
-        </button>
+    // Flashlight cone
+    const rayFrac = (i / RAY_COUNT - 0.5) * 2; // -1..1
+    const coneLight = flashlightOn
+      ? Math.max(0, 1 - Math.abs(rayFrac) * 2.5) * 0.8
+      : 0;
+    const ambientLight = 0.04;
+    const totalLight = Math.min(1, (ambientLight + coneLight) * bright);
 
-        <button
-          onClick={onLeftDoor}
-          className={`w-full py-2 rounded text-xs font-black font-mono border transition-all ${
-            leftDoorClosed
-              ? "bg-red-900/40 border-red-500 text-red-400"
-              : "bg-gray-900 border-gray-700 text-gray-600 hover:border-gray-500"
-          }`}
-        >
-          {leftDoorClosed ? "ОТКР" : "ЗАКР"}
-        </button>
+    // Wall color: purple/crimson tones with texture
+    const texStripe = Math.floor(hit.wallX * 8) % 2 === 0 ? 1.0 : 0.85;
+    const r = Math.floor(80 * totalLight * texStripe);
+    const g = Math.floor(5 * totalLight * texStripe);
+    const b = Math.floor(90 * totalLight * texStripe);
 
-        <div className="text-gray-700 font-mono text-xs mt-1">◄ ЛЕВО</div>
-      </div>
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(Math.floor(i * sliceW), Math.floor(wallTop), Math.ceil(sliceW) + 1, Math.ceil(wallH));
 
-      {/* MAIN OFFICE */}
-      <div className="flex-1 relative overflow-hidden">
-        <StaticOverlay intensity={0.15} />
+    // Baseboard
+    if (corrDist < MAX_DEPTH * 0.5) {
+      ctx.fillStyle = `rgba(30,0,35,${totalLight * 0.6})`;
+      ctx.fillRect(Math.floor(i * sliceW), Math.floor(wallTop + wallH - 4), Math.ceil(sliceW) + 1, 4);
+    }
+  }
 
-        {/* Office room */}
-        <div className="absolute inset-0 flex items-center justify-center">
-          <div className="relative w-full h-full">
-            {/* Desk */}
-            <div
-              className="absolute bottom-0 left-0 right-0 h-1/3"
-              style={{ background: "linear-gradient(to top, #0a0a0a, #111)" }}
-            >
-              <div className="absolute top-0 left-0 right-0 h-1 bg-gray-800" />
-              {/* Monitor */}
-              <div className="absolute top-4 left-1/2 -translate-x-1/2 w-32 h-20 bg-gray-900 border border-gray-700 rounded flex items-center justify-center">
-                <div className="text-green-400/30 text-xs font-mono text-center">
-                  <div>КАМЕРЫ</div>
-                  <div className="text-lg">📷</div>
-                </div>
-              </div>
-              {/* Fan */}
-              <div className="absolute top-6 right-24 text-2xl animate-spin" style={{ animationDuration: "2s" }}>🌀</div>
-              {/* Freddy mask */}
-              <div className="absolute top-4 left-16 text-2xl opacity-60">🎭</div>
-            </div>
+  // ── Flashlight cone overlay ──
+  if (flashlightOn) {
+    const grad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, W * 0.55);
+    grad.addColorStop(0,   "rgba(255,230,180,0.18)");
+    grad.addColorStop(0.4, "rgba(255,180,100,0.06)");
+    grad.addColorStop(1,   "rgba(0,0,0,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
 
-            {/* Back wall */}
-            <div
-              className="absolute top-0 left-0 right-0"
-              style={{
-                height: "67%",
-                background: "linear-gradient(to bottom, #0d1a0d, #0a140a)",
-              }}
-            >
-              {/* Posters */}
-              <div className="absolute top-8 left-1/4 text-xs text-green-900/20 font-mono rotate-1">📋 POSTER</div>
-              <div className="absolute top-12 right-1/4 text-xs text-green-900/20 font-mono -rotate-1">🎪 FNAF</div>
+  // ── Sprite rendering (animatronics) ──
+  const sprites: { anim: Animatronic; dist: number }[] = [];
+  for (const anim of s.animatronics) {
+    if (!anim.active) continue;
+    const dx = anim.x + 0.5 - px;
+    const dy = anim.y + 0.5 - py;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 0.5 || dist > MAX_DEPTH) continue;
+    sprites.push({ anim, dist });
+  }
+  sprites.sort((a, b) => b.dist - a.dist);
 
-              {/* Ceiling light */}
-              <div
-                className="absolute top-0 left-1/2 -translate-x-1/2 w-48 h-32 rounded-full opacity-20"
-                style={{ background: "radial-gradient(ellipse, #1a4a1a, transparent)" }}
-              />
-            </div>
+  for (const { anim, dist } of sprites) {
+    const dx = anim.x + 0.5 - px;
+    const dy = anim.y + 0.5 - py;
 
-            {/* Left door frame */}
-            <div className="absolute left-0 top-0 bottom-1/3 w-16 bg-gray-950 border-r border-gray-800 flex items-center justify-center">
-              {leftDoorClosed ? (
-                <div className="w-full h-full bg-gray-900 flex items-center justify-center">
-                  <span className="text-gray-600 text-xs font-mono rotate-90">ЗАКРЫТО</span>
-                </div>
-              ) : (
-                <div className="w-full h-full" style={{ background: leftLightOn && leftEnemy ? "#1a0000" : "transparent" }}>
-                  {leftLightOn && leftEnemy && (
-                    <div className="flex items-center justify-center h-full">
-                      <span className="text-5xl" style={{ filter: `drop-shadow(0 0 15px ${leftEnemy.color})` }}>
-                        {leftEnemy.emoji}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+    // Transform to camera space
+    const invDet = 1.0 / (Math.cos(angle) * Math.sin(angle + Math.PI / 2) - Math.sin(angle) * Math.cos(angle + Math.PI / 2));
+    const transformX = invDet * (Math.cos(angle + Math.PI / 2) * dx - Math.cos(angle) * dy);
+    const transformY = invDet * (Math.sin(angle) * dx - Math.sin(angle + Math.PI / 2) * dy) ;
 
-            {/* Right door frame */}
-            <div className="absolute right-0 top-0 bottom-1/3 w-16 bg-gray-950 border-l border-gray-800 flex items-center justify-center">
-              {rightDoorClosed ? (
-                <div className="w-full h-full bg-gray-900 flex items-center justify-center">
-                  <span className="text-gray-600 text-xs font-mono rotate-90">ЗАКРЫТО</span>
-                </div>
-              ) : (
-                <div className="w-full h-full" style={{ background: rightLightOn && rightEnemy ? "#1a0000" : "transparent" }}>
-                  {rightLightOn && rightEnemy && (
-                    <div className="flex items-center justify-center h-full">
-                      <span className="text-5xl" style={{ filter: `drop-shadow(0 0 15px ${rightEnemy.color})` }}>
-                        {rightEnemy.emoji}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+    // Hmm simplify: just use angle to sprite
+    const spriteAngle = Math.atan2(dy, dx);
+    let angleDiff = spriteAngle - angle;
+    while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+    while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
 
-        {/* Battery warning */}
-        {battery < 20 && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 text-red-500 font-mono text-xs animate-pulse font-bold tracking-widest">
-            ⚠ НИЗКИЙ ЗАРЯД ⚠
-          </div>
-        )}
-      </div>
+    if (Math.abs(angleDiff) > HALF_FOV * 1.5) continue;
 
-      {/* RIGHT PANEL */}
-      <div className="w-28 flex flex-col items-center justify-center gap-3 border-l border-green-900/20 bg-black/40 px-2 py-4">
-        <div
-          className="w-20 h-28 rounded-lg border border-green-900/30 relative overflow-hidden transition-all duration-200"
-          style={{ background: rightLightOn ? (rightEnemy ? "#3a0000" : "#0a1a00") : "#000" }}
-        >
-          {rightLightOn && rightEnemy && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center">
-              <div className="text-4xl" style={{ filter: `drop-shadow(0 0 10px ${rightEnemy.color})` }}>
-                {rightEnemy.emoji}
-              </div>
-            </div>
-          )}
-          {rightLightOn && !rightEnemy && (
-            <div className="absolute inset-0 flex items-center justify-center text-green-900/30 text-xs font-mono">пусто</div>
-          )}
-        </div>
+    const screenX = W / 2 + (angleDiff / HALF_FOV) * (W / 2);
+    const spriteH = Math.min(H * 1.2, H / dist * 1.0);
+    const spriteTop = H / 2 - spriteH * 0.6;
+    const spriteW = spriteH * 0.7;
 
-        <button
-          onClick={onRightLight}
-          className={`w-full py-1.5 rounded text-xs font-bold font-mono border transition-all ${
-            rightLightOn
-              ? "bg-yellow-400/20 border-yellow-400 text-yellow-400"
-              : "bg-gray-900 border-gray-700 text-gray-600 hover:border-gray-500"
-          }`}
-        >
-          СВЕТ
-        </button>
+    // Check occlusion via zBuffer
+    const stripStart = Math.floor(screenX - spriteW / 2);
+    const stripEnd   = Math.floor(screenX + spriteW / 2);
+    let visible = false;
+    for (let s = Math.max(0, stripStart); s < Math.min(W, stripEnd); s++) {
+      const zIdx = Math.floor((s / W) * RAY_COUNT);
+      if (zBuffer[zIdx] > dist) { visible = true; break; }
+    }
+    if (!visible) continue;
 
-        <button
-          onClick={onRightDoor}
-          className={`w-full py-2 rounded text-xs font-black font-mono border transition-all ${
-            rightDoorClosed
-              ? "bg-red-900/40 border-red-500 text-red-400"
-              : "bg-gray-900 border-gray-700 text-gray-600 hover:border-gray-500"
-          }`}
-        >
-          {rightDoorClosed ? "ОТКР" : "ЗАКР"}
-        </button>
+    // Sprite brightness from flashlight
+    const spriteFrac = (screenX / W - 0.5) * 2;
+    const spriteLight = flashlightOn
+      ? Math.max(0.05, 1 - Math.abs(spriteFrac) * 2.0) * Math.max(0, 1 - dist / 6)
+      : Math.max(0, 0.03 * (1 - dist / MAX_DEPTH));
 
-        <div className="text-gray-700 font-mono text-xs mt-1">ПРАВО ►</div>
-      </div>
-    </div>
-  );
-}
+    // Draw sprite as emoji scaled
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, spriteLight * 3 + 0.1);
+    const fontSize = Math.max(12, spriteH * 0.55);
+    ctx.font = `${fontSize}px serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
 
-// ─── HUD ─────────────────────────────────────────────────────────────────────
-function HUD({
-  hour, battery, night, view, onToggleCamera,
-}: {
-  hour: number; battery: number; night: number;
-  view: View; onToggleCamera: () => void;
-}) {
-  const batteryColor = battery > 50 ? "#22c55e" : battery > 20 ? "#f59e0b" : "#ef4444";
-
-  return (
-    <div className="absolute top-0 left-0 right-0 z-30 flex items-center justify-between px-4 py-2 bg-black/80 border-b border-green-900/30">
-      <div className="font-mono text-xs text-green-400">
-        <span className="text-green-600">НОЧЬ</span> {night} &nbsp;
-        <span className="text-green-600">ЧАС</span>{" "}
-        {hour === 0 ? "12:00 AM" : hour < 6 ? `${hour}:00 AM` : "6:00 AM"}
-      </div>
-
-      <button
-        onClick={onToggleCamera}
-        className={`px-4 py-1 rounded font-mono text-xs font-bold border transition-all ${
-          view === "cameras"
-            ? "bg-green-900/40 border-green-500 text-green-300"
-            : "bg-gray-900 border-gray-600 text-gray-400 hover:border-gray-400"
-        }`}
-      >
-        {view === "cameras" ? "▼ ОПУСТИТЬ" : "▲ КАМЕРЫ"}
-      </button>
-
-      <div className="flex items-center gap-2 font-mono text-xs">
-        <span style={{ color: batteryColor }}>⚡</span>
-        <div className="w-24 h-2 bg-gray-800 rounded-full overflow-hidden border border-gray-700">
-          <div
-            className="h-full rounded-full transition-all duration-500"
-            style={{ width: `${battery}%`, background: batteryColor }}
-          />
-        </div>
-        <span style={{ color: batteryColor }}>{Math.floor(battery)}%</span>
-      </div>
-    </div>
-  );
-}
-
-// ─── MENU ────────────────────────────────────────────────────────────────────
-function MenuScreen({ onStart, night }: { onStart: () => void; night: number }) {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black z-40">
-      <div className="text-center">
-        <div className="text-6xl mb-4">🐻</div>
-        <h1 className="text-4xl font-black text-green-400 font-mono tracking-widest mb-2">
-          FREDDY&apos;S
-        </h1>
-        <p className="text-green-700 font-mono text-sm mb-1">ПЯТЬ НОЧЕЙ У ФРЕДДИ</p>
-        <p className="text-gray-600 font-mono text-xs mb-10">Веб-версия</p>
-
-        <div className="text-green-800 font-mono text-xs mb-6">
-          НОЧЬ {night} из 5
-        </div>
-
-        <button
-          onClick={onStart}
-          className="px-10 py-3 bg-green-900/30 border-2 border-green-500 text-green-300 font-mono font-black text-sm rounded hover:bg-green-900/50 transition-all hover:scale-105 tracking-widest"
-        >
-          ► НАЧАТЬ НОЧЬ {night}
-        </button>
-
-        <div className="mt-10 text-gray-700 font-mono text-xs max-w-xs text-center leading-relaxed">
-          Следи за аниматрониками через камеры.<br />
-          Закрывай двери если они рядом.<br />
-          Продержись до 6:00 утра.
-        </div>
-
-        <div className="mt-6 flex gap-6 justify-center">
-          {INITIAL_ANIMATRONICS.map(a => (
-            <div key={a.id} className="text-center">
-              <div className="text-2xl">{a.emoji}</div>
-              <div className="text-xs font-mono mt-1" style={{ color: a.color }}>{a.name}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── WIN / LOSE SCREENS ───────────────────────────────────────────────────────
-function DeadScreen({ onRestart }: { onRestart: () => void }) {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black z-40">
-      <div className="text-6xl mb-4 animate-bounce">💀</div>
-      <h2 className="text-3xl font-black text-red-500 font-mono tracking-widest mb-2">GAME OVER</h2>
-      <p className="text-red-800 font-mono text-sm mb-8">Аниматроник добрался до тебя...</p>
-      <button
-        onClick={onRestart}
-        className="px-8 py-3 bg-red-900/30 border-2 border-red-600 text-red-400 font-mono font-black text-sm rounded hover:bg-red-900/50 transition-all"
-      >
-        ↺ ПОПРОБОВАТЬ СНОВА
-      </button>
-    </div>
-  );
-}
-
-function WinScreen({ night, onNext }: { night: number; onNext: () => void }) {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black z-40">
-      <div className="text-6xl mb-4">⭐</div>
-      <h2 className="text-3xl font-black text-green-400 font-mono tracking-widest mb-2">
-        {night >= 5 ? "ВЫ ПОБЕДИЛИ!" : `НОЧЬ ${night} ПРОЙДЕНА`}
-      </h2>
-      <p className="text-green-700 font-mono text-sm mb-8">
-        {night >= 5 ? "Все 5 ночей позади. Вы выжили!" : "Продержитесь ещё одну ночь..."}
-      </p>
-      <button
-        onClick={onNext}
-        className="px-8 py-3 bg-green-900/30 border-2 border-green-500 text-green-300 font-mono font-black text-sm rounded hover:bg-green-900/50 transition-all"
-      >
-        {night >= 5 ? "↺ СНАЧАЛА" : `► НОЧЬ ${night + 1}`}
-      </button>
-    </div>
-  );
-}
-
-// ─── MAIN GAME ────────────────────────────────────────────────────────────────
-export default function Index() {
-  const [night, setNight] = useState(1);
-  const [phase, setPhase] = useState<GamePhase>("menu");
-  const [view, setView] = useState<View>("office");
-  const [activeCamera, setActiveCamera] = useState<Room>("cam1A");
-  const [hour, setHour] = useState(0);
-  const [battery, setBattery] = useState(100);
-  const [leftDoorClosed, setLeftDoorClosed] = useState(false);
-  const [rightDoorClosed, setRightDoorClosed] = useState(false);
-  const [leftLightOn, setLeftLightOn] = useState(false);
-  const [rightLightOn, setRightLightOn] = useState(false);
-  const [animatronics, setAnimatronics] = useState<Animatronic[]>(INITIAL_ANIMATRONICS);
-  const [screamAnim, setScreamAnim] = useState<Animatronic | null>(null);
-  const [showStatic, setShowStatic] = useState(false);
-
-  const gameLoopRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const hourTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const batteryRef = useRef(100);
-  const phaseRef = useRef<GamePhase>("menu");
-
-  phaseRef.current = phase;
-
-  const triggerDeath = useCallback((anim: Animatronic) => {
-    setPhase("dead");
-    setScreamAnim(anim);
-    setShowStatic(true);
-    setTimeout(() => setShowStatic(false), 500);
-  }, []);
-
-  const startGame = useCallback((n: number) => {
-    const difficulty = n;
-    const anims = INITIAL_ANIMATRONICS.map(a => ({
-      ...a,
-      room: a.id === "foxy" ? "cam2A" as Room : "cam1A" as Room,
-      moveTimer: 0,
-      moveInterval: Math.max(5, a.moveInterval - (difficulty - 1) * 2),
-    }));
-    setAnimatronics(anims);
-    setBattery(100);
-    batteryRef.current = 100;
-    setHour(0);
-    setView("office");
-    setLeftDoorClosed(false);
-    setRightDoorClosed(false);
-    setLeftLightOn(false);
-    setRightLightOn(false);
-    setScreamAnim(null);
-    setPhase("playing");
-  }, []);
-
-  // ── GAME LOOP ──
-  useEffect(() => {
-    if (phase !== "playing") {
-      if (gameLoopRef.current) clearInterval(gameLoopRef.current);
-      if (hourTimerRef.current) clearInterval(hourTimerRef.current);
-      return;
+    // Glow effect when close
+    if (dist < 2.5) {
+      ctx.shadowColor = anim.color;
+      ctx.shadowBlur = 30 * (1 - dist / 2.5);
     }
 
-    // Hour timer
-    hourTimerRef.current = setInterval(() => {
-      setHour(h => {
-        if (h >= 5) {
-          setPhase("win");
-          return h;
-        }
-        return h + 1;
-      });
-    }, HOUR_DURATION);
+    ctx.fillText(anim.emoji, screenX, H / 2 - spriteH * 0.05);
+    ctx.restore();
+  }
 
-    // Main tick: 1s
-    gameLoopRef.current = setInterval(() => {
-      if (phaseRef.current !== "playing") return;
+  // ── Door overlays ──
+  if (doorLeft) {
+    const dg = ctx.createLinearGradient(0, 0, W * 0.18, 0);
+    dg.addColorStop(0, "rgba(10,0,15,0.95)");
+    dg.addColorStop(1, "rgba(10,0,15,0)");
+    ctx.fillStyle = dg;
+    ctx.fillRect(0, 0, W * 0.18, H);
+    ctx.fillStyle = "rgba(80,0,100,0.3)";
+    ctx.fillRect(0, H * 0.1, 12, H * 0.8);
+  }
+  if (doorRight) {
+    const dg = ctx.createLinearGradient(W, 0, W * 0.82, 0);
+    dg.addColorStop(0, "rgba(10,0,15,0.95)");
+    dg.addColorStop(1, "rgba(10,0,15,0)");
+    ctx.fillStyle = dg;
+    ctx.fillRect(W * 0.82, 0, W * 0.18, H);
+    ctx.fillStyle = "rgba(80,0,100,0.3)";
+    ctx.fillRect(W - 12, H * 0.1, 12, H * 0.8);
+  }
+
+  // ── Vignette ──
+  const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.8);
+  vig.addColorStop(0, "rgba(0,0,0,0)");
+  vig.addColorStop(1, "rgba(0,0,0,0.85)");
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Flicker noise ──
+  if (flickerAlpha > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${flickerAlpha * 0.08})`;
+    ctx.fillRect(0, 0, W, H);
+    // Scanlines
+    for (let y = 0; y < H; y += 4) {
+      ctx.fillStyle = `rgba(0,0,0,${flickerAlpha * 0.3})`;
+      ctx.fillRect(0, y, W, 2);
+    }
+  }
+
+  // ── Hour display (subtle) ──
+  ctx.fillStyle = "rgba(150,0,180,0.25)";
+  ctx.font = "11px 'Courier New'";
+  ctx.textAlign = "right";
+  ctx.fillText(`${s.hour === 0 ? "12" : s.hour}:00 AM`, W - 10, H - 10);
+}
+
+// ─── ANIMATRONIC DEFINITIONS ─────────────────────────────────────────────────
+function makeAnimatronics(night: number): Animatronic[] {
+  const speed = Math.max(4, 9 - night);
+  return [
+    { id: "bonnie",  name: "Бонни",  emoji: "🐰", color: "#7C3AED", x: 0, y: 4, moveTimer: 0, moveInterval: speed,     active: true },
+    { id: "chica",   name: "Чика",   emoji: "🐦", color: "#D97706", x: 8, y: 4, moveTimer: 0, moveInterval: speed + 1, active: true },
+    { id: "freddy",  name: "Фредди", emoji: "🐻", color: "#92400E", x: 4, y: 0, moveTimer: 0, moveInterval: speed + 2, active: night >= 2 },
+    { id: "foxy",    name: "Фокси",  emoji: "🦊", color: "#DC2626", x: 4, y: 8, moveTimer: 0, moveInterval: speed - 1, active: night >= 3 },
+  ];
+}
+
+// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
+export default function Index() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stateRef  = useRef({
+    px: PLAYER_START.x + 0.5,
+    py: PLAYER_START.y + 0.5,
+    angle: 0,
+    map: RAW_MAP.map(r => [...r]),
+    animatronics: makeAnimatronics(1),
+    flashlightOn: false,
+    flickerAlpha: 0,
+    doorLeft: false,
+    doorRight: false,
+    battery: 100,
+    hour: 0,
+    night: 1,
+    phase: "menu" as GamePhase,
+    keys: {} as Record<string, boolean>,
+    moveTimer: 0,
+    animTick: 0,
+    hourTick: 0,
+    scream: null as Animatronic | null,
+    screamTimer: 0,
+    mouseDX: 0,
+  });
+  const rafRef    = useRef<number>(0);
+
+  // React UI state (mirrors stateRef for rendering React UI)
+  const [phase,       setPhase]       = useState<GamePhase>("menu");
+  const [battery,     setBattery]     = useState(100);
+  const [hour,        setHour]        = useState(0);
+  const [night,       setNight]       = useState(1);
+  const [doorLeft,    setDoorLeft]    = useState(false);
+  const [doorRight,   setDoorRight]   = useState(false);
+  const [flashOn,     setFlashOn]     = useState(false);
+  const [scream,      setScream]      = useState<Animatronic | null>(null);
+  const [winNight,    setWinNight]    = useState(1);
+
+  const s = stateRef.current;
+
+  // ── Input ──
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { s.keys[e.code] = true; };
+    const up   = (e: KeyboardEvent) => { s.keys[e.code] = false; };
+    const move = (e: MouseEvent)    => { if (s.phase === "playing") s.mouseDX += e.movementX; };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup",   up);
+    window.addEventListener("mousemove", move);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup",   up);
+      window.removeEventListener("mousemove", move);
+    };
+  }, [s]);
+
+  // ── Canvas pointer lock ──
+  const requestLock = useCallback(() => {
+    canvasRef.current?.requestPointerLock();
+  }, []);
+
+  // ── Start night ──
+  const startNight = useCallback((n: number) => {
+    s.px = PLAYER_START.x + 0.5;
+    s.py = PLAYER_START.y + 0.5;
+    s.angle = 0;
+    s.map = RAW_MAP.map(r => [...r]);
+    s.animatronics = makeAnimatronics(n);
+    s.battery = 100;
+    s.hour = 0;
+    s.night = n;
+    s.phase = "playing";
+    s.doorLeft = false;
+    s.doorRight = false;
+    s.flashlightOn = false;
+    s.flickerAlpha = 0;
+    s.scream = null;
+    s.screamTimer = 0;
+    s.moveTimer = 0;
+    s.animTick = 0;
+    s.hourTick = 0;
+    setBattery(100);
+    setHour(0);
+    setNight(n);
+    setDoorLeft(false);
+    setDoorRight(false);
+    setFlashOn(false);
+    setScream(null);
+    setPhase("playing");
+  }, [s]);
+
+  // ── Toggle doors ──
+  const toggleLeft  = useCallback(() => {
+    s.doorLeft = !s.doorLeft;
+    setDoorLeft(v => !v);
+  }, [s]);
+
+  const toggleRight = useCallback(() => {
+    s.doorRight = !s.doorRight;
+    setDoorRight(v => !v);
+  }, [s]);
+
+  const toggleFlash = useCallback(() => {
+    s.flashlightOn = !s.flashlightOn;
+    setFlashOn(v => !v);
+  }, [s]);
+
+  // ── Death ──
+  const triggerDeath = useCallback((anim: Animatronic) => {
+    s.phase = "dead";
+    s.scream = anim;
+    s.screamTimer = 150;
+    setPhase("dead");
+    setScream(anim);
+  }, [s]);
+
+  // ── Main loop ──
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d")!;
+
+    let lastTime = 0;
+    let tick = 0;
+
+    function loop(ts: number) {
+      rafRef.current = requestAnimationFrame(loop);
+      const dt = ts - lastTime;
+      if (dt < 16) return; // cap ~60fps
+      lastTime = ts;
+      tick++;
+
+      const s = stateRef.current;
+      const W = canvas!.width;
+      const H = canvas!.height;
+
+      if (s.phase === "menu" || s.phase === "win") {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, W, H);
+        return;
+      }
+
+      if (s.phase === "dead") {
+        // Scream flash
+        if (s.screamTimer > 0) {
+          s.screamTimer -= dt / 16;
+          const t = s.screamTimer / 150;
+          ctx.fillStyle = `rgb(${Math.floor(180 * t)},0,0)`;
+          ctx.fillRect(0, 0, W, H);
+          s.flickerAlpha = t;
+        }
+        return;
+      }
+
+      // ── Playing ──
+
+      // Mouse look
+      const MOUSE_SENS = 0.002;
+      s.angle += s.mouseDX * MOUSE_SENS;
+      s.mouseDX = 0;
+
+      // Keyboard turn
+      const TURN_SPEED = 0.035;
+      if (s.keys["ArrowLeft"]  || s.keys["KeyA"]) s.angle -= TURN_SPEED;
+      if (s.keys["ArrowRight"] || s.keys["KeyD"]) s.angle += TURN_SPEED;
+
+      // Movement
+      const MOVE_SPEED = 0.05;
+      let nx = s.px;
+      let ny = s.py;
+      if (s.keys["ArrowUp"] || s.keys["KeyW"]) {
+        nx += Math.cos(s.angle) * MOVE_SPEED;
+        ny += Math.sin(s.angle) * MOVE_SPEED;
+      }
+      if (s.keys["ArrowDown"] || s.keys["KeyS"]) {
+        nx -= Math.cos(s.angle) * MOVE_SPEED;
+        ny -= Math.sin(s.angle) * MOVE_SPEED;
+      }
+      // Collision
+      if (!isWall(s.map, nx, s.py)) s.px = nx;
+      if (!isWall(s.map, s.px, ny)) s.py = ny;
+
+      // Flashlight key
+      if (s.keys["KeyF"] && !s._fPrev) {
+        s.flashlightOn = !s.flashlightOn;
+        setFlashOn(s.flashlightOn);
+      }
+      (s as Record<string, unknown>)._fPrev = s.keys["KeyF"];
 
       // Battery drain
-      setLeftLightOn(ll => {
-        setRightLightOn(rl => {
-          setView(v => {
-            setLeftDoorClosed(ld => {
-              setRightDoorClosed(rd => {
-                let drain = BATTERY_DRAIN_BASE;
-                if (ld) drain += DOOR_DRAIN;
-                if (rd) drain += DOOR_DRAIN;
-                if (ll) drain += LIGHT_DRAIN;
-                if (rl) drain += LIGHT_DRAIN;
-                if (v === "cameras") drain += CAMERA_DRAIN;
+      s.battery -= 0.008;
+      if (s.flashlightOn) s.battery -= 0.012;
+      if (s.doorLeft)  s.battery -= 0.010;
+      if (s.doorRight) s.battery -= 0.010;
+      s.battery = Math.max(0, s.battery);
+      if (tick % 10 === 0) setBattery(Math.floor(s.battery));
 
-                const newBat = clamp(batteryRef.current - drain, 0, 100);
-                batteryRef.current = newBat;
-                setBattery(newBat);
+      if (s.battery <= 0) {
+        s.flashlightOn = false;
+        setFlashOn(false);
+      }
 
-                if (newBat <= 0) {
-                  setPhase("dead");
-                  const dummyAnim = INITIAL_ANIMATRONICS[0];
-                  setScreamAnim(dummyAnim);
-                }
-                return rd;
-              });
-              return ld;
-            });
-            return v;
+      // Hour tick (every ~600 frames ≈ 10s real)
+      s.hourTick++;
+      if (s.hourTick >= 600) {
+        s.hourTick = 0;
+        s.hour++;
+        setHour(s.hour);
+        if (s.hour >= 6) {
+          s.phase = "win";
+          setWinNight(s.night);
+          setPhase("win");
+          return;
+        }
+      }
+
+      // Flicker
+      s.flickerAlpha = Math.max(0, s.flickerAlpha - 0.05);
+      if (Math.random() < 0.003) s.flickerAlpha = Math.random() * 0.6;
+
+      // ── Animatronic AI ──
+      s.animTick++;
+      if (s.animTick >= 60) {
+        s.animTick = 0;
+        for (const anim of s.animatronics) {
+          if (!anim.active) continue;
+          anim.moveTimer++;
+          if (anim.moveTimer < anim.moveInterval) continue;
+          anim.moveTimer = 0;
+
+          const dxTotal = (PLAYER_START.x + 0.5) - (anim.x + 0.5); // aim toward office
+          const dyTotal = (PLAYER_START.y + 0.5) - (anim.y + 0.5);
+
+          // Choose direction toward player with some randomness
+          const dirs: Direction[] = ["forward", "back", "left", "right"];
+          const weights = dirs.map(d => {
+            let wx = anim.x, wy = anim.y;
+            if (d === "forward") wy--;
+            if (d === "back")    wy++;
+            if (d === "left")    wx--;
+            if (d === "right")   wx++;
+            if (isWall(s.map, wx + 0.5, wy + 0.5)) return -999;
+            const ddx = (PLAYER_START.x + 0.5) - (wx + 0.5);
+            const ddy = (PLAYER_START.y + 0.5) - (wy + 0.5);
+            return -(ddx * ddx + ddy * ddy) + (Math.random() - 0.5) * 4;
           });
-          return rl;
-        });
-        return ll;
+
+          let best = -1;
+          let bestW = -Infinity;
+          for (let i = 0; i < dirs.length; i++) {
+            if (weights[i] > bestW) { bestW = weights[i]; best = i; }
+          }
+
+          if (best >= 0) {
+            const d = dirs[best];
+            if (d === "forward") anim.y--;
+            if (d === "back")    anim.y++;
+            if (d === "left")    anim.x--;
+            if (d === "right")   anim.x++;
+          }
+
+          // Clamp to map
+          anim.x = Math.max(0, Math.min(MAP_W - 1, anim.x));
+          anim.y = Math.max(0, Math.min(MAP_H - 1, anim.y));
+
+          // Check if reached player
+          const distToPlayer = Math.hypot(anim.x + 0.5 - s.px, anim.y + 0.5 - s.py);
+          if (distToPlayer < 1.2) {
+            // Check door block
+            const isLeft  = anim.x === 0 && s.doorLeft;
+            const isRight = anim.x === MAP_W - 1 && s.doorRight;
+            if (!isLeft && !isRight) {
+              s.flickerAlpha = 1;
+              setTimeout(() => triggerDeath(anim), 300);
+              return;
+            }
+          }
+        }
+      }
+
+      // ── Render ──
+      renderFrame(ctx, W, H, {
+        px: s.px, py: s.py, angle: s.angle,
+        map: s.map,
+        animatronics: s.animatronics,
+        flashlightOn: s.flashlightOn,
+        flickerAlpha: s.flickerAlpha,
+        doorLeft: s.doorLeft,
+        doorRight: s.doorRight,
+        hour: s.hour,
       });
+    }
 
-      // Move animatronics
-      setAnimatronics(prev => {
-        const next = prev.map(a => {
-          if (a.room === "gone") return a;
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [triggerDeath]);
 
-          const newTimer = a.moveTimer + 1;
-          if (newTimer < a.moveInterval) return { ...a, moveTimer: newTimer };
+  // ── Scream auto-clear ──
+  useEffect(() => {
+    if (!scream) return;
+    const t = setTimeout(() => {
+      setScream(null);
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [scream]);
 
-          // Time to move
-          const currentRoom = a.room;
-
-          // At left_door or right_door — try to get in
-          if (currentRoom === "left_door") {
-            // Check if door closed
-            setLeftDoorClosed(ld => {
-              if (!ld) {
-                // Attack!
-                setTimeout(() => {
-                  if (phaseRef.current === "playing") {
-                    triggerDeath(a);
-                  }
-                }, 100);
-              }
-              return ld;
-            });
-            return { ...a, moveTimer: 0, room: "gone" as const };
-          }
-
-          if (currentRoom === "right_door") {
-            setRightDoorClosed(rd => {
-              if (!rd) {
-                setTimeout(() => {
-                  if (phaseRef.current === "playing") {
-                    triggerDeath(a);
-                  }
-                }, 100);
-              }
-              return rd;
-            });
-            return { ...a, moveTimer: 0, room: "gone" as const };
-          }
-
-          // Normal movement
-          const roomData = ROOMS[currentRoom as Room];
-          if (!roomData) return { ...a, moveTimer: 0 };
-
-          const neighbors = roomData.neighbors;
-          const nextRoomOptions: (Room | "left_door" | "right_door")[] = [...neighbors];
-
-          // Bonnie goes left, others go right, foxy varies
-          if (a.id === "bonnie" && (currentRoom === "cam2A" || currentRoom === "cam3")) {
-            nextRoomOptions.push("left_door");
-          }
-          if ((a.id === "chica" || a.id === "freddy") && (currentRoom === "cam4A" || currentRoom === "cam4B")) {
-            nextRoomOptions.push("right_door");
-          }
-          if (a.id === "foxy" && currentRoom === "cam1B") {
-            nextRoomOptions.push("left_door");
-          }
-
-          const nextRoom = nextRoomOptions[Math.floor(Math.random() * nextRoomOptions.length)];
-
-          // Static flash on move
-          setShowStatic(true);
-          setTimeout(() => setShowStatic(false), 150);
-
-          return { ...a, moveTimer: 0, room: nextRoom };
-        });
-        return next;
-      });
-    }, 1000);
-
-    return () => {
-      if (gameLoopRef.current) clearInterval(gameLoopRef.current);
-      if (hourTimerRef.current) clearInterval(hourTimerRef.current);
-    };
-  }, [phase, triggerDeath]);
-
-  const handleScreamDone = () => {
-    setScreamAnim(null);
-  };
+  const batteryColor = battery > 50 ? "#22c55e" : battery > 20 ? "#f59e0b" : "#ef4444";
+  const hourLabel = hour === 0 ? "12:00 AM" : `${hour}:00 AM`;
 
   return (
-    <div
-      className="w-screen h-screen relative overflow-hidden bg-black select-none"
-      style={{ fontFamily: "'Courier New', monospace" }}
-    >
-      {/* MENU */}
-      {phase === "menu" && <MenuScreen onStart={() => startGame(night)} night={night} />}
+    <div className="w-screen h-screen bg-black overflow-hidden relative select-none"
+      style={{ fontFamily: "'Courier New', monospace" }}>
 
-      {/* DEAD */}
-      {phase === "dead" && !screamAnim && <DeadScreen onRestart={() => { setNight(1); setPhase("menu"); }} />}
+      {/* CANVAS */}
+      <canvas
+        ref={canvasRef}
+        width={800}
+        height={500}
+        onClick={requestLock}
+        className="absolute inset-0 w-full h-full"
+        style={{ imageRendering: "pixelated", cursor: "crosshair" }}
+      />
 
-      {/* WIN */}
-      {phase === "win" && (
-        <WinScreen
-          night={night}
-          onNext={() => {
-            const nextNight = night >= 5 ? 1 : night + 1;
-            setNight(nextNight);
-            setPhase("menu");
-          }}
-        />
+      {/* ── MENU ── */}
+      {phase === "menu" && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black">
+          <div className="text-center max-w-md px-6">
+            <div className="text-7xl mb-4 animate-bounce">🐻</div>
+            <h1 className="text-3xl font-black text-purple-400 tracking-widest mb-1">FREDDY&apos;S</h1>
+            <p className="text-purple-700 text-sm mb-1 tracking-widest">ПЯТЬ НОЧЕЙ</p>
+            <p className="text-gray-600 text-xs mb-8">Псевдо-3D хоррор</p>
+
+            <button
+              onClick={() => startNight(night)}
+              className="px-10 py-3 border-2 border-purple-600 text-purple-300 font-black text-sm rounded hover:bg-purple-900/30 transition-all hover:scale-105 tracking-widest mb-6"
+            >
+              ► НОЧЬ {night}
+            </button>
+
+            <div className="text-gray-700 text-xs leading-6 space-y-1 mt-4">
+              <div><span className="text-purple-600">WASD / ↑↓←→</span> — движение и поворот</div>
+              <div><span className="text-purple-600">МЫШЬ</span> — осмотреться (кликни для захвата)</div>
+              <div><span className="text-purple-600">F</span> — фонарик</div>
+              <div><span className="text-purple-600">Q / E</span> — левая / правая дверь</div>
+              <div className="pt-2 text-gray-800">Продержись до 6:00 утра. Не трать батарею зря.</div>
+            </div>
+
+            <div className="flex gap-6 justify-center mt-8">
+              {makeAnimatronics(night).filter(a => a.active).map(a => (
+                <div key={a.id} className="text-center">
+                  <div className="text-2xl">{a.emoji}</div>
+                  <div className="text-xs mt-1" style={{ color: a.color }}>{a.name}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       )}
 
-      {/* PLAYING */}
-      {(phase === "playing" || phase === "dead") && (
+      {/* ── HUD ── */}
+      {phase === "playing" && (
         <>
-          <HUD
-            hour={hour}
-            battery={battery}
-            night={night}
-            view={view}
-            onToggleCamera={() => setView(v => v === "cameras" ? "office" : "cameras")}
-          />
-
-          <div className="absolute inset-0 pt-10">
-            {view === "office" ? (
-              <OfficeView
-                leftDoorClosed={leftDoorClosed}
-                rightDoorClosed={rightDoorClosed}
-                leftLightOn={leftLightOn}
-                rightLightOn={rightLightOn}
-                onLeftDoor={() => setLeftDoorClosed(v => !v)}
-                onRightDoor={() => setRightDoorClosed(v => !v)}
-                onLeftLight={() => setLeftLightOn(v => !v)}
-                onRightLight={() => setRightLightOn(v => !v)}
-                animatronics={animatronics}
-                battery={battery}
-              />
-            ) : (
-              <CameraView
-                activeCamera={activeCamera}
-                animatronics={animatronics}
-                onSelectCamera={setActiveCamera}
-                showStatic={showStatic}
-              />
-            )}
+          {/* Top bar */}
+          <div className="absolute top-0 left-0 right-0 z-30 flex items-center justify-between px-4 py-2 bg-black/70">
+            <div className="text-xs text-purple-500">
+              НОЧЬ <span className="text-purple-300 font-bold">{night}</span>
+              &nbsp;&nbsp;
+              <span className="text-purple-700">{hourLabel}</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <span style={{ color: batteryColor }}>⚡</span>
+              <div className="w-20 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-300"
+                  style={{ width: `${battery}%`, background: batteryColor }} />
+              </div>
+              <span style={{ color: batteryColor }}>{battery}%</span>
+            </div>
           </div>
 
-          {/* Global static flash */}
-          {showStatic && (
-            <div className="absolute inset-0 z-20 pointer-events-none bg-white/5 animate-pulse" />
+          {/* Crosshair */}
+          <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center">
+            <div className="w-4 h-px bg-white/20" />
+            <div className="absolute w-px h-4 bg-white/20" />
+          </div>
+
+          {/* Left door button */}
+          <div className="absolute left-3 bottom-16 z-30 flex flex-col gap-2">
+            <button
+              onClick={toggleLeft}
+              className={`px-3 py-2 text-xs font-black border rounded transition-all ${
+                doorLeft
+                  ? "bg-red-900/50 border-red-500 text-red-400"
+                  : "bg-black/60 border-gray-700 text-gray-500 hover:border-purple-700"
+              }`}
+            >
+              ◄ ДВЕРЬ<br />[Q]
+            </button>
+          </div>
+
+          {/* Right door button */}
+          <div className="absolute right-3 bottom-16 z-30 flex flex-col gap-2">
+            <button
+              onClick={toggleRight}
+              className={`px-3 py-2 text-xs font-black border rounded transition-all ${
+                doorRight
+                  ? "bg-red-900/50 border-red-500 text-red-400"
+                  : "bg-black/60 border-gray-700 text-gray-500 hover:border-purple-700"
+              }`}
+            >
+              ДВЕРЬ ►<br />[E]
+            </button>
+          </div>
+
+          {/* Flashlight button */}
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30">
+            <button
+              onClick={toggleFlash}
+              className={`px-6 py-2 text-xs font-black border rounded-full transition-all ${
+                flashOn
+                  ? "bg-yellow-900/40 border-yellow-500 text-yellow-300"
+                  : "bg-black/60 border-gray-700 text-gray-600 hover:border-yellow-800"
+              }`}
+            >
+              🔦 ФОНАРИК [F]
+            </button>
+          </div>
+
+          {/* Controls hint */}
+          <div className="absolute bottom-4 right-4 z-30 text-gray-800 text-xs text-right leading-5">
+            WASD / ↑↓←→ движение<br/>
+            Мышь — обзор
+          </div>
+
+          {/* Low battery warning */}
+          {battery < 15 && (
+            <div className="absolute top-12 left-1/2 -translate-x-1/2 z-30 text-red-500 text-xs font-black animate-pulse tracking-widest">
+              ⚠ БАТАРЕЯ РАЗРЯЖАЕТСЯ ⚠
+            </div>
           )}
 
-          {/* Scream */}
-          {screamAnim && (
-            <ScreamScreen anim={screamAnim} onDone={handleScreamDone} />
-          )}
+          {/* Key handlers via invisible overlay */}
+          <KeyHandler
+            onQ={toggleLeft}
+            onE={toggleRight}
+            onF={toggleFlash}
+          />
         </>
       )}
 
+      {/* ── SCREAM ── */}
+      {scream && phase === "dead" && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black animate-scream-bg">
+          <div
+            className="text-[140px] leading-none animate-scream-pop"
+            style={{ filter: `drop-shadow(0 0 60px ${scream.color}) drop-shadow(0 0 100px ${scream.color})` }}
+          >
+            {scream.emoji}
+          </div>
+          <div className="text-3xl font-black mt-4 tracking-widest" style={{ color: scream.color }}>
+            {scream.name.toUpperCase()}
+          </div>
+          <div className="text-red-500 text-lg font-bold mt-2 animate-pulse">ВЫ МЕРТВЫ</div>
+        </div>
+      )}
+
+      {/* ── DEAD (after scream) ── */}
+      {phase === "dead" && !scream && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black">
+          <div className="text-5xl mb-4">💀</div>
+          <h2 className="text-2xl font-black text-red-600 tracking-widest mb-2">GAME OVER</h2>
+          <p className="text-red-900 text-sm mb-8 font-mono">Тебя нашли в темноте...</p>
+          <button
+            onClick={() => { setPhase("menu"); s.phase = "menu"; }}
+            className="px-8 py-3 border-2 border-red-700 text-red-500 font-black text-sm rounded hover:bg-red-900/20 transition-all"
+          >
+            ↺ СНОВА
+          </button>
+        </div>
+      )}
+
+      {/* ── WIN ── */}
+      {phase === "win" && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black">
+          <div className="text-5xl mb-4">⭐</div>
+          <h2 className="text-2xl font-black text-purple-400 tracking-widest mb-2">
+            {winNight >= 5 ? "ВЫ ВЫЖИЛИ!" : `НОЧЬ ${winNight} ПРОЙДЕНА`}
+          </h2>
+          <p className="text-purple-800 text-sm mb-8">
+            {winNight >= 5 ? "Все 5 ночей позади." : "Ещё одна ночь впереди..."}
+          </p>
+          <button
+            onClick={() => {
+              const next = winNight >= 5 ? 1 : winNight + 1;
+              setNight(next);
+              s.night = next;
+              setPhase("menu");
+              s.phase = "menu";
+            }}
+            className="px-8 py-3 border-2 border-purple-600 text-purple-400 font-black text-sm rounded hover:bg-purple-900/20 transition-all"
+          >
+            {winNight >= 5 ? "↺ СНАЧАЛА" : `► НОЧЬ ${winNight + 1}`}
+          </button>
+        </div>
+      )}
+
       <style>{`
-        @keyframes scream {
-          0% { opacity: 0; transform: scale(0.8); }
-          10% { opacity: 1; transform: scale(1.1); }
-          20% { transform: scale(0.95); }
-          30% { transform: scale(1.05); }
-          100% { opacity: 1; transform: scale(1); }
+        @keyframes screamBg {
+          0%   { background: #000; }
+          10%  { background: #1a0000; }
+          30%  { background: #0a0000; }
+          100% { background: #000; }
         }
-        @keyframes screamEmoji {
-          0% { transform: scale(0) rotate(-20deg); }
-          30% { transform: scale(1.3) rotate(5deg); }
-          50% { transform: scale(0.9) rotate(-3deg); }
-          70% { transform: scale(1.1) rotate(2deg); }
-          100% { transform: scale(1) rotate(0deg); }
+        @keyframes screamPop {
+          0%   { transform: scale(0) rotate(-30deg); opacity: 0; }
+          40%  { transform: scale(1.4) rotate(8deg);  opacity: 1; }
+          60%  { transform: scale(0.9) rotate(-4deg); }
+          80%  { transform: scale(1.1) rotate(2deg); }
+          100% { transform: scale(1)   rotate(0deg); }
         }
-        .animate-scream { animation: scream 0.3s ease-out forwards; }
-        .animate-scream-emoji { animation: screamEmoji 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        .animate-scream-bg  { animation: screamBg  2.5s ease forwards; }
+        .animate-scream-pop { animation: screamPop 0.6s cubic-bezier(0.175,0.885,0.32,1.275) forwards; }
       `}</style>
     </div>
   );
+}
+
+// ── Key handler component ──────────────────────────────────────────────────────
+function KeyHandler({ onQ, onE, onF }: { onQ: () => void; onE: () => void; onF: () => void }) {
+  const prevQ = useRef(false);
+  const prevE = useRef(false);
+  const prevF = useRef(false);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.code === "KeyQ" && !prevQ.current) { onQ(); }
+      if (e.code === "KeyE" && !prevE.current) { onE(); }
+      if (e.code === "KeyF" && !prevF.current) { onF(); }
+      prevQ.current = e.code === "KeyQ";
+      prevE.current = e.code === "KeyE";
+      prevF.current = e.code === "KeyF";
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.code === "KeyQ") prevQ.current = false;
+      if (e.code === "KeyE") prevE.current = false;
+      if (e.code === "KeyF") prevF.current = false;
+    };
+    window.addEventListener("keydown", handler);
+    window.addEventListener("keyup",   up);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      window.removeEventListener("keyup",   up);
+    };
+  }, [onQ, onE, onF]);
+
+  return null;
 }
